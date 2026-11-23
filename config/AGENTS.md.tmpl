@@ -1,0 +1,66 @@
+# AGENTS.md — ortak çalışma sözleşmesi
+
+Bu dosya projedeki tüm ajanlar tarafından okunur (OpenCode, Codex, Claude Code).
+`worker init` ile bir projeye kopyalandığında `CLAUDE.md` ona symlink olur.
+
+## Roller
+- **Orkestratör:** OpenCode. Görevi dağıtır, sonucu birleştirir; kendi dosya yazmaz.
+- **codex:** otonom kod yazma/değiştirme. Sandbox `workspace-write`, ayrı git worktree.
+- **claude:** planlama, kod inceleme, ikinci görüş. Varsayılan salt-okunur.
+- **commandcode:** ajan değil; yalnızca model yönlendiren API köprüsü.
+
+## Çıktı sözleşmesi (her worker için)
+1. Ne yaptığını 1-3 cümleyle özetle.
+2. Değişen dosyaları listele.
+3. Çalıştırdığın test komutunu ve sonucunu yaz.
+4. Belirsiz kalan kararları `SORU:` etiketiyle bildir.
+
+## Kod kuralları
+- Mevcut mimariye, isimlendirmeye ve stile uy; yeni desen icat etme.
+- Diff küçük olsun; ilgisiz dosyalara dokunma.
+- Davranış değiştiyse test ekle/güncelle ve çalıştır.
+- Var olan kullanıcı değişikliklerini ezme; önce incele.
+- Commit mesajı: `alan: kısa açıklama` (ör. `auth: token yenileme düzeltmesi`).
+
+## Güvenlik
+- Sır (API anahtarı, token, parola) dosyaya yazma, log'a basma, ekrana dökme.
+- `rm -rf`, `git reset --hard`, force-push, veritabanı silme gibi geri dönüşsüz işlemleri onay olmadan yapma.
+- İnternete veri gönderen komutlarda önce ne gönderildiğini açıkla.
+
+## İletişim (global kural)
+- Kullanıcıya her zaman **kısa ve basit** yaz: en fazla 5-6 satır, sade Türkçe.
+- Önce sonuç, sonra tek cümle neden. Uzun kanıt, kod dökümü, tablo, terim yığını yok.
+- Kullanıcı istemedikçe detay/analiz ekleme; "detay ister misin?" diye bitir.
+- Anlaşılmadı denirse aynı şeyi daha da kısa ve gündelik dille tekrar anlat.
+
+## Ortam gerçekleri
+- Node.js, Python 3 ve git beklenir. `jq`, `rg`, `fd`, `gh` gibi araçlar opsiyoneldir.
+- Ağır işleri ortam kaynaklarına göre sırayla yürüt; paralel ajan sayısını sınırla.
+- Kullanıcıya Türkçe yanıt ver; kod ve commit mesajları İngilizce olabilir.
+
+## Görev boyutu
+- Her delege çağrısı tek bir işi kapsar; 3+ dosya veya 2+ ayrı konu varsa böl.
+- Uzun görevleri küçük, doğrulanabilir parçalara ayır.
+
+## Model yapılandırması
+- Varsayılan modeller `WORKER_MODEL_OPENCODE`, `WORKER_MODEL_CODEX`, `WORKER_MODEL_CLAUDE` ve `WORKER_MODEL_CRUSH` ile override edilebilir.
+- Model adını değiştirmeden önce sağlayıcının bu adı desteklediğini doğrula.
+
+## Devretme kuralı (orkestratör = OpenCode)
+İSTİSNA YOK — görevin küçük olması devretmemeyi gerektirmez.
+- Dosya oluşturma/düzenleme/silme içeren **her** görev → `delegate_codex` (tek satırlık dosya bile).
+- Plan, mimari karar, kod inceleme, ikinci görüş → `delegate_claude`.
+- Araştırma, keşif, uzun log okuma, ortam kontrolü → `delegate_crush`.
+- Sadece sohbet/açıklama/bilgi sorusu → kendin yanıtla.
+- Dosya yazma denemesi boşuna: orkestratörün edit yetkisi yok.
+
+## Facade
+Tek giriş noktası `worker`:
+```
+worker status | doctor | budget | runs
+worker ask  "<görev>"     # orkestratör
+worker plan "<görev>"     # claude, salt-okunur
+worker code "<görev>"     # codex, yazma
+worker review "<görev>"   # claude, salt-okunur
+worker run <ajan> "<görev>" -w <worktree-adı>
+```

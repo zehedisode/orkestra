@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""
+worker-mcp — codex ve claude'u OpenCode'a "araç" olarak tanıtır.
+Böylece orkestratör (OpenCode) gerekince onları alt ajan gibi çağırır.
+"""
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+from mcp.server.fastmcp import FastMCP
+
+HOME = Path.home()
+AGENT_HOME = Path(os.environ.get("WORKER_HOME", HOME / ".agent"))
+WORKER = os.environ.get("WORKER_BIN", str(HOME / ".local" / "bin" / "worker"))
+RUNS = AGENT_HOME / "runs"
+
+mcp = FastMCP("workers")
+
+
+def _latest_run(agent, after):
+    try:
+        cands = [d for d in RUNS.glob(f"*-{agent}-*") if d.is_dir() and d.stat().st_mtime >= after - 2]
+    except OSError:
+        return None
+    return max(cands, key=lambda d: d.stat().st_mtime) if cands else None
+
+
+def _delegate(agent, task, write, worktree, timeout):
+    started = time.time()
+    cmd = [WORKER, "run", agent, task, "--quiet", "--timeout", str(timeout)]
+    if write:
+        cmd.append("--write")
+    if worktree:
+        cmd += ["-w", worktree]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 90)
+    except subprocess.TimeoutExpired:
+        return f"{agent} zaman aşımına uğradı ({timeout}s). Daha küçük bir görev dene."
+    except FileNotFoundError:
+        return "worker komutu bulunamadı."
+
+    run = _latest_run(agent, started)
+    if run is None:
+        return f"{agent} çalıştı ama kayıt bulunamadı. Çıktı: {p.stdout[-800:]}"
+
+    meta = {}
+    try:
+        meta = json.loads((run / "meta.json").read_text())
+    except Exception:
+        pass
+
+    answer = ""
+    for name in ("last-message.md", "output.log"):
+        f = run / name
+        if f.exists() and f.stat().st_size > 0:
+            answer = f.read_text(errors="replace").strip()
+            break
+    if len(answer) > 6000:
+        answer = answer[:2000] + "\n...[kısaltıldı]...\n" + answer[-4000:]
+
+    parts = [f"[{agent}] çıkış={meta.get('exit_code')} süre={meta.get('duration_s')}s"]
+    if meta.get("diff"):
+        parts.append(f"değişiklik özeti: {meta['diff']}")
+    parts.append(answer or "(çıktı boş)")
+    return "\n".join(parts)
+
+
+@mcp.tool()
+def delegate_codex(task: str, worktree: str = "", timeout: int = 900) -> str:
+    """Kod yazma/değiştirme işini Codex'e devret. Codex dosya oluşturur, düzenler, komut çalıştırır.
+    worktree verirsen iş ayrı bir git dalında yapılır ve ana klasör bozulmaz.
+    Sadece gerçekten kod/dosya değişikliği gerektiren işler için kullan."""
+    return _delegate("codex", task, True, worktree, timeout)
+
+
+@mcp.tool()
+def delegate_claude(task: str, timeout: int = 900) -> str:
+    """Planlama, analiz, kod inceleme veya ikinci görüş için Claude Code'a devret.
+    Salt-okunur çalışır: dosya değiştirmez. Karar vermeden önce danışmak için kullan."""
+    return _delegate("claude", task, False, "", timeout)
+
+
+@mcp.tool()
+def delegate_crush(task: str, write: bool = False, timeout: int = 900) -> str:
+    """Görevi Crush'a devret. Varsayılan salt-okunur; write=True ile dosya değiştirebilir."""
+    return _delegate("crush", task, write, "", timeout)
+
+
+if __name__ == "__main__":
+    mcp.run()

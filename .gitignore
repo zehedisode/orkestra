@@ -1,0 +1,8 @@
+runs/
+worktrees/
+*.log
+.env
+*.bak-*
+__pycache__/
+*.pyc
+.venv/

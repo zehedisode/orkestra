@@ -1,0 +1,57 @@
+{
+  "$schema": "https://charm.land/crush.json",
+  "providers": {
+    "commandcode": {
+      "id": "commandcode",
+      "name": "CommandCode",
+      "type": "openai-compat",
+      "base_url": "https://api.commandcode.ai/provider/v1",
+      "api_key": "$COMMANDCODE_API_KEY",
+      "models": [
+        {
+          "id": "deepseek/deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash",
+          "cost_per_1m_in": 0,
+          "cost_per_1m_out": 0,
+          "cost_per_1m_in_cached": 0,
+          "cost_per_1m_out_cached": 0,
+          "context_window": 1000000,
+          "default_max_tokens": 65536,
+          "can_reason": true,
+          "supports_attachments": false
+        }
+      ]
+    },
+    "opencode-go": {
+      "id": "opencode-go",
+      "name": "OpenCode Go",
+      "type": "openai-compat",
+      "base_url": "https://opencode.ai/inference/go/v1",
+      "api_key": "$OPENCODE_GO_KEY",
+      "models": [
+        {
+          "id": "deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash",
+          "cost_per_1m_in": 0,
+          "cost_per_1m_out": 0,
+          "cost_per_1m_in_cached": 0,
+          "cost_per_1m_out_cached": 0,
+          "context_window": 1000000,
+          "default_max_tokens": 65536,
+          "can_reason": true,
+          "supports_attachments": false
+        }
+      ]
+    }
+  },
+  "models": {
+    "large": {
+      "provider": "commandcode",
+      "model": "deepseek/deepseek-v4.1-flash"
+    },
+    "small": {
+      "provider": "opencode-go",
+      "model": "deepseek-v4.1-flash"
+    }
+  }
+}

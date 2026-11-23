@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""
+worker — çok-ajanlı orkestrasyon facade'ı
+=========================================
+Tek komut, dört worker + bir orkestratör. Her koşu bir run dizinine kaydedilir.
+
+  worker status                 ajanların durumu (sürüm / model / anahtar)
+  worker doctor                 ortam kontrolü (eksik ne var)
+  worker budget                 OpenCode Go kullanım limitleri
+  worker ask "<görev>"          orkestratör: opencode (Go / DeepSeek V4.1 Flash)
+  worker plan "<görev>"         claude, salt-okunur, plan/analiz
+  worker code "<görev>"         codex, workspace-write (kod yazar)
+  worker review "<görev>"       claude, salt-okunur, kod inceleme
+  worker run <ajan> "<görev>"   elle: opencode | codex | claude | crush
+  worker init [dizin]           projeye AGENTS.md + CLAUDE.md kurar
+  worker runs                   son koşuları listeler
+
+Seçenekler: -C/--dir, -w/--worktree, --read-only, --write, -m/--model,
+            --timeout, --json, --quiet
+"""
+import argparse
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+AGENT_HOME = Path(os.environ.get("WORKER_HOME", HOME / ".agent"))
+RUNS = AGENT_HOME / "runs"
+WORKTREES = AGENT_HOME / "worktrees"
+GO_ENV = HOME / ".config" / "opencode-go-proxy.env"
+CMD_AUTH = HOME / ".commandcode" / "auth.json"
+OPENCODE_CFG = HOME / ".config" / "opencode" / "opencode.json"
+CODEX_CFG = HOME / ".codex" / "config.toml"
+CLAUDE_CFG = HOME / ".claude" / "settings.json"
+GO_USAGE = "https://opencode.ai/inference/go/v1/usage"
+
+DEFAULT_MODELS = {
+    "opencode": os.environ.get("WORKER_MODEL_OPENCODE", "opencode-go/deepseek-v4.1-flash"),
+    "codex": os.environ.get("WORKER_MODEL_CODEX", "deepseek/deepseek-v4.1-flash"),
+    "claude": os.environ.get("WORKER_MODEL_CLAUDE", "deepseek-v4.1-flash"),
+    "crush": os.environ.get("WORKER_MODEL_CRUSH", "deepseek/deepseek-v4.1-flash"),
+}
+
+AGENT_TIMEOUTS = {
+    "codex": 600,
+    "claude": 420,
+    "crush": 300,
+    "opencode": 300,
+}
+
+STALE_AFTER_S = 15 * 60
+
+C = {"g": "\033[32m", "r": "\033[31m", "y": "\033[33m", "d": "\033[2m", "b": "\033[1m", "x": "\033[0m"}
+
+
+def tty(stream=None):
+    return (stream or sys.stdout).isatty()
+
+
+def paint(s, color):
+    return f"{C[color]}{s}{C['x']}" if tty() else s
+
+
+# ---------------------------------------------------------------- anahtarlar
+def go_key():
+    if os.environ.get("OPENCODE_GO_KEY"):
+        return os.environ["OPENCODE_GO_KEY"]
+    try:
+        for line in GO_ENV.read_text().splitlines():
+            if line.startswith("OPENCODE_GO_KEY="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def cmd_key():
+    if os.environ.get("COMMANDCODE_API_KEY"):
+        return os.environ["COMMANDCODE_API_KEY"]
+    try:
+        return json.loads(CMD_AUTH.read_text()).get("apiKey")
+    except Exception:
+        return None
+
+
+def child_env():
+    env = os.environ.copy()
+    extra = [HOME / ".local/bin", HOME / ".local/node/bin", HOME / ".opencode/bin",
+             HOME / ".local/lib/node/bin"]
+    env["PATH"] = ":".join([str(p) for p in extra] + [env.get("PATH", "")])
+    k = go_key()
+    if k:
+        env["OPENCODE_GO_KEY"] = k
+    c = cmd_key()
+    if c:
+        env["COMMANDCODE_API_KEY"] = c
+    return env
+
+
+# ---------------------------------------------------------------- ajan tanımı
+def have(binary):
+    return shutil.which(binary, path=child_env()["PATH"]) is not None
+
+
+def version_of(binary, args=("--version",)):
+    try:
+        out = subprocess.run([binary, *args], capture_output=True, text=True,
+                             timeout=30, env=child_env())
+        text = (out.stdout or out.stderr).strip().splitlines()
+        return text[0].strip() if text else "?"
+    except Exception:
+        return "?"
+
+
+def build_cmd(agent, task, cwd, model, write, want_json, last_file):
+    model = model or DEFAULT_MODELS.get(agent)
+    if agent == "codex":
+        sandbox = "workspace-write" if write else "read-only"
+        cmd = ["codex", "exec", "--skip-git-repo-check", "-C", str(cwd),
+               "--sandbox", sandbox,
+               "-c", "sandbox_workspace_write.network_access=true",
+               "-o", str(last_file)]
+        if model:
+            cmd += ["-c", f'model="{model}"']
+        if want_json:
+            cmd += ["--json"]
+        cmd += [task]
+        return cmd, model
+    if agent == "claude":
+        fmt = "json" if want_json else "stream-json"
+        cmd = ["claude", "-p", task, "--output-format", fmt]
+        if not want_json:
+            cmd += ["--verbose"]
+        if model:
+            cmd += ["--model", model]
+        if write:
+            cmd += ["--dangerously-skip-permissions"]
+        else:
+            cmd += ["--permission-mode", "plan"]
+        return cmd, model
+    if agent == "opencode":
+        cmd = ["opencode", "run", "--format", "json" if want_json else "default", "--archived"]
+        if model:
+            cmd += ["--model", model]
+        if write:
+            cmd += ["--auto"]
+        cmd += [task]
+        return cmd, model
+    if agent == "crush":
+        cmd = ["crush", "run", "--cwd", str(cwd)]
+        if model:
+            cmd += ["--model", model]
+        if write:
+            cmd += ["-y"]
+        cmd += [task]
+        return cmd, model
+    raise SystemExit(f"bilinmeyen ajan: {agent}")
+
+
+# ---------------------------------------------------------------- çalıştırma
+def slugify(text, n=32):
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return s[:n].rstrip("-") or "task"
+
+
+def git_root(path):
+    try:
+        out = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=20)
+        return Path(out.stdout.strip()) if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def make_worktree(base, name):
+    WORKTREES.mkdir(parents=True, exist_ok=True)
+    root = git_root(base) or base
+    label = f"{slugify(root.name, 16)}-{slugify(name, 20)}"
+    dest = WORKTREES / label
+    if dest.exists():
+        dest = WORKTREES / f"{label}-{int(time.time())}"
+    branch = f"agent/{slugify(name, 30)}-{int(time.time()) % 100000}"
+    r = subprocess.run(["git", "-C", str(root), "worktree", "add", "-b", branch, str(dest)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"worktree oluşturulamadı: {r.stderr.strip()}")
+    # worktree'ye ortak kuralları taşı (commit edilmemiş olabilir)
+    for name in ("AGENTS.md",):
+        src = root / name
+        if src.exists() and not (dest / name).exists():
+            shutil.copyfile(src, dest / name)
+    for alias in ("CLAUDE.md",):
+        link = dest / alias
+        if not link.exists():
+            try:
+                link.symlink_to("AGENTS.md")
+            except OSError:
+                pass
+    # kopyalanan kural dosyaları diff'e girmesin
+    try:
+        gp = subprocess.run(["git", "-C", str(dest), "rev-parse", "--git-path", "info/exclude"],
+                            capture_output=True, text=True).stdout.strip()
+        if gp:
+            excl = (dest / gp) if not os.path.isabs(gp) else Path(gp)
+            excl.parent.mkdir(parents=True, exist_ok=True)
+            with excl.open("a") as fh:
+                fh.write("\n# worker: ortak kurallar\nAGENTS.md\nCLAUDE.md\n")
+    except Exception:
+        pass
+    return dest, branch
+
+
+def readable_claude_event(line):
+    try:
+        event = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return line, None
+    if not isinstance(event, dict):
+        return line, None
+    kind = event.get("type")
+    if kind == "assistant":
+        message = event.get("message") or {}
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            text = content
+        else:
+            parts = [part.get("text") for part in content or []
+                     if isinstance(part, dict) and part.get("type") == "text"
+                     and isinstance(part.get("text"), str) and part["text"]]
+            text = "\n".join(parts)
+        if not text:
+            return "", None
+        return text if text.endswith("\n") else text + "\n", None
+    if kind == "result":
+        result = event.get("result")
+        if isinstance(result, str) and result:
+            return result if result.endswith("\n") else result + "\n", result
+        return "", None
+    return "", None
+
+
+def run_agent(agent, task, cwd, worktree=None, model=None, write=False,
+              want_json=False, timeout=None, quiet=False):
+    timeout = timeout if timeout is not None else AGENT_TIMEOUTS[agent]
+    RUNS.mkdir(parents=True, exist_ok=True)
+    cwd = Path(cwd or os.getcwd())
+    branch = None
+    if worktree:
+        cwd, branch = make_worktree(cwd, worktree)
+        print(paint(f"worktree: {cwd}  (branch {branch})", "d"))
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    run_dir = RUNS / f"{stamp}-{agent}-{slugify(task, 24)}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "task.md").write_text(task)
+    last_file = run_dir / "last-message.md"
+
+    cmd, model_used = build_cmd(agent, task, cwd, model, write, want_json, last_file)
+    (run_dir / "cmd.txt").write_text(" ".join(cmd) + "\n")
+
+    print(paint(f"▶ {agent} · {model_used} · {'yazma' if write else 'salt-okunur'} · {cwd}", "b"))
+    started = time.time()
+    skeleton = {
+        "agent": agent, "model": model_used, "cwd": str(cwd),
+        "worktree": str(cwd) if worktree else None, "branch": branch,
+        "sandbox": "write" if write else "read-only",
+        "started": datetime.fromtimestamp(started, timezone.utc).isoformat(),
+        "status": "running", "run_dir": str(run_dir),
+    }
+    (run_dir / "meta.json").write_text(json.dumps(skeleton, indent=2) + "\n")
+    log = run_dir / "output.log"
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(cwd), env=child_env(),
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+        parse_stream = agent == "claude" and not want_json
+        lines = queue.Queue()
+
+        def pump_output():
+            try:
+                for line in proc.stdout:
+                    lines.put(line)
+            finally:
+                lines.put(None)
+
+        threading.Thread(target=pump_output, daemon=True).start()
+        timed_out = False
+        with log.open("w") as fh:
+            while True:
+                remaining = timeout - (time.time() - started)
+                if remaining <= 0:
+                    timed_out = True
+                    proc.kill()
+                    break
+                try:
+                    line = lines.get(timeout=remaining)
+                except queue.Empty:
+                    timed_out = True
+                    proc.kill()
+                    break
+                if line is None:
+                    break
+                text, _ = readable_claude_event(line) if parse_stream else (line, None)
+                if text:
+                    fh.write(text)
+                    fh.flush()
+                    if not quiet:
+                        sys.stdout.write(text)
+                        sys.stdout.flush()
+        if timed_out:
+            print(paint(f"\n! zaman aşımı ({timeout}s), süreç öldürüldü", "r"))
+        code = proc.wait()
+    except FileNotFoundError:
+        raise SystemExit(f"{agent} bulunamadı — kurulu mu? PATH: {child_env()['PATH']}")
+
+    elapsed = round(time.time() - started, 1)
+    diff_file = None
+    if worktree:
+        # niyet-ekle ile yeni dosyalar da diff'e girsin, sonra geri al
+        subprocess.run(["git", "-C", str(cwd), "add", "-N", "."], capture_output=True)
+        diff = subprocess.run(["git", "-C", str(cwd), "diff"],
+                              capture_output=True, text=True).stdout
+        subprocess.run(["git", "-C", str(cwd), "reset", "-q"], capture_output=True)
+        status = subprocess.run(["git", "-C", str(cwd), "status", "--porcelain"],
+                                capture_output=True, text=True).stdout
+        diff_file = run_dir / "diff.patch"
+        diff_file.write_text(f"# git status\n{status}\n# diff\n{diff}")
+
+    out = (run_dir / "output.log").read_text() if log.exists() else ""
+    meta = {
+        "agent": agent, "model": model_used, "cwd": str(cwd),
+        "worktree": str(cwd) if worktree else None, "branch": branch,
+        "sandbox": "write" if write else "read-only",
+        "started": datetime.fromtimestamp(started, timezone.utc).isoformat(),
+        "duration_s": elapsed, "status": "done", "exit_code": code, "run_dir": str(run_dir),
+        "diff": str(diff_file) if diff_file else None,
+        "output_chars": len(out),
+    }
+    if timed_out:
+        meta["timed_out"] = True
+    reason = None
+    if timed_out:
+        reason = "timeout"
+    elif code in (-9, 137):
+        reason = "oom"
+    elif code in (-15, 143):
+        reason = "sigterm"
+    elif code == 124:
+        reason = "timeout"
+    elif code != 0:
+        reason = "hata"
+    if reason:
+        meta["reason"] = reason
+    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+
+    ok = code == 0
+    summary = f"{'✓' if ok else '✗'} {agent} bitti · {elapsed}s · çıkış {code}"
+    if reason:
+        summary += f" · sebep={reason}"
+    print(paint(summary, "g" if ok else "r"))
+    print(paint(f"  run: {run_dir}", "d"))
+    if diff_file:
+        print(paint(f"  diff: {diff_file}", "d"))
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- komutlar
+def cmd_status(_):
+    rows = [
+        ("opencode", "OpenCode", lambda: version_of("opencode"), go_key() is not None,
+         f"go key {'var' if go_key() else 'YOK'}"),
+        ("codex", "Codex", lambda: version_of("codex", ("--version",)), cmd_key() is not None,
+         f"cmd key {'var' if cmd_key() else 'YOK'}"),
+        ("claude", "Claude Code", lambda: version_of("claude"), go_key() is not None,
+         f"go key {'var' if go_key() else 'YOK'}"),
+        ("crush", "Crush", lambda: version_of("crush"), cmd_key() is not None,
+         f"cmd key {'var' if cmd_key() else 'YOK'}"),
+        ("commandcode", "CommandCode", lambda: version_of("commandcode"), cmd_key() is not None,
+         "sadece model yönlendirici"),
+    ]
+    print(paint("AJAN            SÜRÜM                 MODEL                              DURUM", "b"))
+    for key, name, ver, ready, note in rows:
+        v = ver() if have(key) else "kurulu değil"
+        model = DEFAULT_MODELS.get(key, "-")
+        mark = paint("✓", "g") if ready else paint("✗", "r")
+        print(f"{name:<15} {v:<21} {model:<34} {mark} {note}")
+    print()
+    print(paint(f"orkestratör modeli: {os.environ.get('WORKER_ORCH', DEFAULT_MODELS['opencode'])}", "d"))
+    print()
+    print(paint("SON KOŞULAR", "b"))
+    stamp = lambda d: (d / "meta.json").stat().st_mtime if (d / "meta.json").exists() else d.stat().st_mtime
+    recent = sorted((d for d in RUNS.glob("*") if d.is_dir()), key=stamp, reverse=True)[:5] if RUNS.exists() else []
+    stale = [d for d in RUNS.glob("*") if d.is_dir() and run_state(d)[0] == "stale"] if RUNS.exists() else []
+    print_runs(sorted(set(recent + stale), key=stamp, reverse=True))
+
+
+def cmd_doctor(_):
+    checks = []
+
+    def add(ok, label, detail=""):
+        checks.append((ok, label, detail))
+
+    add(have("opencode"), "opencode bulundu", "~/.opencode/bin/opencode")
+    add(have("codex"), "codex bulundu", "~/.local/node/bin/codex")
+    add(have("claude"), "claude bulundu", "~/.local/bin/claude")
+    add(have("crush"), "crush bulundu", f"~/.local/lib/node/bin/crush · {DEFAULT_MODELS['crush']}")
+    add(have("git"), "git bulundu")
+    add(bool(go_key()), "OPENCODE_GO_KEY okunuyor", "~/.config/opencode-go-proxy.env")
+    add(bool(cmd_key()), "COMMANDCODE_API_KEY okunuyor", "~/.commandcode/auth.json")
+    add(OPENCODE_CFG.exists(), "opencode.json var")
+    add(CODEX_CFG.exists(), "codex config.toml var")
+    add(CLAUDE_CFG.exists(), "claude settings.json var")
+    for b in ("jq", "rg", "fd", "ast-grep", "gh", "tmux"):
+        add(have(b), f"opsiyonel araç: {b}")
+    mem = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+    add(mem >= 12, "RAM >= 12 GB (lokal model için)", f"{mem:.1f} GB")
+    for ok, label, detail in checks:
+        icon = paint("✓", "g") if ok else paint("!", "y")
+        print(f" {icon} {label:<38} {paint(detail, 'd')}")
+    missing = [c[1] for c in checks if not c[0]]
+    print()
+    print(paint(f"{len(checks)-len(missing)}/{len(checks)} geçti", "g" if not missing else "y"))
+
+
+def cmd_budget(_):
+    key = go_key()
+    if not key:
+        raise SystemExit("OPENCODE_GO_KEY yok")
+    req = urllib.request.Request(GO_USAGE, headers={
+        "Authorization": f"Bearer {key}",
+        "User-Agent": "worker/1.0",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+    except Exception as e:
+        raise SystemExit(f"bütçe alınamadı: {e}")
+    usage = data.get("usage", {})
+    names = {"rolling": "5 saatlik", "weekly": "haftalık", "monthly": "aylık"}
+    for k, label in names.items():
+        u = usage.get(k, {})
+        pct = u.get("percent", "?")
+        status = u.get("status", "?")
+        color = "g" if status == "ok" else "r"
+        bar = "█" * int(pct / 5) + "·" * (20 - int(pct / 5)) if isinstance(pct, int) else ""
+        print(f"{label:<10} {paint(f'{bar} {pct}%', color)}  {status}  {paint(u.get('resetsAt',''), 'd')}")
+
+
+def run_state(d):
+    try:
+        meta = json.loads((d / "meta.json").read_text())
+    except Exception:
+        meta = None
+    if meta is None:
+        try:
+            stale = time.time() - d.stat().st_mtime > STALE_AFTER_S
+        except OSError:
+            stale = False
+        return ("stale" if stale else "running"), {}
+    return meta.get("status", "?"), meta
+
+
+def print_runs(dirs):
+    if not dirs:
+        print("henüz koşu yok")
+        return
+    for d in dirs:
+        state, meta = run_state(d)
+        ok = meta.get("exit_code") == 0
+        icon = paint("✓", "g") if ok else paint("✗", "r" if state != "stale" else "y")
+        print(f"{icon} {d.name:<48} {meta.get('duration_s','?'):>6}s  {meta.get('agent','?'):<8} {state}")
+
+
+def cmd_runs(args):
+    dirs = sorted(RUNS.glob("*"), reverse=True)
+    listed = dirs[: args.limit]
+    stale = [d for d in dirs if d.is_dir() and run_state(d)[0] == "stale"]
+    print_runs(sorted(set(listed + stale), reverse=True))
+
+
+def cmd_init(args):
+    target = Path(args.directory or os.getcwd())
+    src = AGENT_HOME / "AGENTS.md"
+    if not src.exists():
+        raise SystemExit(f"kaynak yok: {src}")
+    dest = target / "AGENTS.md"
+    if dest.exists():
+        print(paint(f"AGENTS.md zaten var: {dest}", "y"))
+    else:
+        shutil.copyfile(src, dest)
+        print(paint(f"✓ {dest}", "g"))
+    for alias in ("CLAUDE.md",):
+        link = target / alias
+        if not link.exists():
+            link.symlink_to("AGENTS.md")
+            print(paint(f"✓ {link} -> AGENTS.md", "g"))
+
+
+# ---------------------------------------------------------------- CLI
+def main():
+    p = argparse.ArgumentParser(prog="worker", description="çok-ajanlı orkestrasyon facade'ı")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="ajan durumu").set_defaults(func=cmd_status)
+    sub.add_parser("doctor", help="ortam kontrolü").set_defaults(func=cmd_doctor)
+    sub.add_parser("budget", help="Go limitleri").set_defaults(func=cmd_budget)
+    r = sub.add_parser("runs", help="son koşular")
+    r.add_argument("-n", "--limit", type=int, default=10)
+    r.set_defaults(func=cmd_runs)
+    i = sub.add_parser("init", help="projeye AGENTS.md kur")
+    i.add_argument("directory", nargs="?")
+    i.set_defaults(func=cmd_init)
+
+    def add_run_flags(sp, agent=None):
+        if agent is None:
+            sp.add_argument("agent", choices=["opencode", "codex", "claude", "crush"])
+        sp.add_argument("task")
+        sp.add_argument("-C", "--dir", default=None)
+        sp.add_argument("-w", "--worktree", nargs="?", const="task", default=None)
+        sp.add_argument("-m", "--model", default=None)
+        sp.add_argument("--read-only", dest="write", action="store_false", default=None)
+        sp.add_argument("--write", dest="write", action="store_true")
+        sp.add_argument("--json", action="store_true")
+        sp.add_argument("--timeout", type=int, default=None)
+        sp.add_argument("--quiet", action="store_true")
+
+    r = sub.add_parser("run", help="ajanı elle çalıştır")
+    add_run_flags(r)
+    r.set_defaults(func=lambda a: run_agent(a.agent, a.task, a.dir, a.worktree, a.model,
+                                            bool(a.write), a.json, a.timeout, a.quiet))
+    shortcuts = {
+        "ask": ("opencode", False),
+        "plan": ("claude", False),
+        "review": ("claude", False),
+        "code": ("codex", True),
+    }
+    for name, (agent, default_write) in shortcuts.items():
+        sp = sub.add_parser(name, help=f"{agent} ile {'yazma' if default_write else 'salt-okunur'}")
+        add_run_flags(sp, agent=agent)
+        sp.set_defaults(_agent=agent, _write=default_write,
+                        func=lambda a: run_agent(a._agent, a.task, a.dir, a.worktree, a.model,
+                                                 a._write if a.write is None else bool(a.write),
+                                                 a.json, a.timeout, a.quiet))
+
+    a = p.parse_args()
+    sys.exit(a.func(a) or 0)
+
+
+if __name__ == "__main__":
+    main()

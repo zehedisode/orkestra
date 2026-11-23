@@ -1,0 +1,67 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode-go/deepseek-v4.1-flash",
+  "default_agent": "orkestra",
+  "agent": {
+    "orkestra": {
+      "description": "Orkestratör: işi Codex, Claude ve Crush'a devreder; kendi dosya yazmaz",
+      "mode": "primary",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "prompt": "Sen bu çalışma ortamının orkestratörüsün. Tek işin görev dağıtmak.\nMUTLAK KURAL: Dosya oluşturma, düzenleme veya silme içeren HER görev — tek satırlık bile olsa — delegate_codex aracına devredilir. Dosya yazma yetkin yok; deneme.\nPlan, mimari karar, kod inceleme veya ikinci görüş istenirse delegate_claude aracını çağır.\nAraştırma, keşif, uzun dosya/log okuma ve ortam kontrolü için delegate_crush aracını çağır.\nSadece sohbet, açıklama ve bilgi sorularını kendin yanıtla.\nDevrettikten sonra sonucu 1-3 cümleyle özetle, ham çıktıyı yapıştırma.\nAynı işi iki ajana verme.",
+      "permission": {
+        "edit": "deny",
+        "bash": "deny"
+      },
+      "steps": 40
+    }
+  },
+  "mcp": {
+    "servers": {
+      "workers": {
+        "type": "local",
+        "command": [
+          "@HOME@/.local/bin/worker-mcp"
+        ],
+        "environment": {
+          "WORKER_HOME": "@WORKER_HOME@"
+        }
+      }
+    }
+  },
+  "providers": {
+    "opencode-go": {
+      "name": "OpenCode Go",
+      "env": [
+        "OPENCODE_GO_KEY"
+      ],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "https://opencode.ai/inference/go/v1"
+      },
+      "models": {
+        "deepseek-v4.1-flash": {
+          "name": "DeepSeek V4.1 Flash",
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
+        }
+      }
+    },
+    "commandcode": {
+      "name": "Command Code",
+      "env": [
+        "COMMANDCODE_API_KEY"
+      ],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "https://api.commandcode.ai/provider/v1"
+      },
+      "models": {
+        "deepseek/deepseek-v4.1-flash": {
+          "name": "DeepSeek V4.1 Flash"
+        }
+      }
+    }
+  }
+}
